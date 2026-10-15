@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <g transform="translate(256, 270)">
+    <!-- Base Shadow Layer (Bottom) -->
+    <path d="M 0 50 L 110 0 L 0 -50 L -110 0 Z" fill="#1a2024" />
+    <path d="M -110 0 L 0 50 L 0 85 L -110 35 Z" fill="#0f1418" />
+    <path d="M 110 0 L 0 50 L 0 85 L 110 35 Z" fill="#0a0e10" />
+    <!-- Neon Boundary Layer (Middle) -->
+    <path d="M 0 -20 L 100 -65 L 0 -110 L -100 -65 Z" fill="none" stroke="#00e5ff" stroke-width="10" stroke-linejoin="miter"/>
+    <path d="M -100 -65 L 0 -20 L 0 5 L -100 -40 Z" fill="none" stroke="#00e5ff" stroke-width="10" stroke-linejoin="miter"/>
+    <path d="M 100 -65 L 0 -20 L 0 5 L 100 -40 Z" fill="none" stroke="#00e5ff" stroke-width="10" stroke-linejoin="miter"/>
+    <!-- Clean Browser Session Layer (Top) -->
+    <path d="M 0 -85 L 85 -125 L 0 -165 L -85 -125 Z" fill="#ffffff" />
+    <path d="M -85 -125 L 0 -85 L 0 -65 L -85 -105 Z" fill="#e0e0e0" />
+    <path d="M 85 -125 L 0 -85 L 0 -65 L 85 -105 Z" fill="#cccccc" />
+  </g>
+</svg>

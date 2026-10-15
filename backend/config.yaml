@@ -1,0 +1,124 @@
+# isola configuration
+server:
+  port: "8080"
+
+docker:
+  host: "unix:///var/run/docker.sock"
+
+# DNS for browser containers.
+#
+# mode:
+#   plain  - pass `servers` to containers via `docker run --dns` (default).
+#            Entries must be IP addresses; an empty list keeps the runtime's
+#            embedded resolver (Docker 127.0.0.11 / Podman gateway).
+#   tls    - DNS-over-TLS: the backend runs a forwarder on the browser-net and
+#            points containers at it, then queries upstream over DoT (port 853).
+#   https  - DNS-over-HTTPS: same shape as tls, over HTTPS (port 443).
+#
+# In tls/https mode each `servers` entry is a DoT/DoH endpoint: a bare IP or
+# hostname is expanded (tls://<server>:853, https://<server>/dns-query), and a
+# full tls:// or https:// URL is used as-is, e.g.
+#   - "https://dns.google/dns-query"
+#   - "tls://dns.quad9.net:853"
+# Env overrides: ISOLA_DNS_MODE, ISOLA_DNS_SERVERS (comma-separated)
+dns:
+  mode: "plain"
+  servers:
+    - "1.1.1.1"
+    - "8.8.8.8"
+    - "9.9.9.9"
+
+# Tor exit-node pinning (optional). Applies only to sessions created with
+# tor_enabled; a session may still override it with its own `tor_country`.
+# Values are ISO 3166-1 alpha-2 codes, comma-separated for more than one
+# (e.g. "se" or "se,no"). Empty (default) allows any exit. StrictNodes is
+# applied, so a pinned country with no reachable exit fails the session rather
+# than quietly egressing elsewhere.
+# Env overrides: ISOLA_TOR_EXIT_COUNTRY
+#
+#   exit_country: "se"
+
+cors:
+  origin: "http://localhost:5173"
+
+session:
+  default_min: 10      # starting session duration in minutes (0 = unlimited)
+  max_min: 30          # maximum session duration in minutes
+  extend_min: 5        # minutes added per extend click
+  inactivity_min: 5    # minutes of no activity before auto-termination
+  timer: true          # when false: no countdown and no extend — the sandbox is
+                       # closed as soon as the owner closes the tab or clicks End
+  resolution: "1920x1080"
+  # Hard cap applied to every requested resolution (aspect ratio preserved).
+  # Bigger captures OOM-kill the sandbox on a 2 GB host, so requests above
+  # this box are scaled down before the container is created.
+  max_resolution: "1920x1080"
+
+# Concurrency: isola is multisession — each POST /api/sessions adds a session and
+# does not terminate the caller's others, and each session is a container, so RAM
+# is the real cost. Cap the concurrently active sessions to what the host can hold;
+# launches past the cap are refused with HTTP 429 (max_sessions_reached).
+# Env only: ISOLA_MAX_SESSIONS (unset / 0 = unlimited).
+
+# Pre-started browser containers so a session starts the moment the user hits
+# enter instead of after the container boot (several seconds even with the
+# image cached). Idle containers cost real RAM — one full session's worth each
+# (the 2 GB per-container memory limit) — so size this to the expected number
+# of concurrent entries. Measured on a 4 GiB Podman VM: a warm claim reaches
+# "running" in ~0.2-0.5 s versus ~2 s cold.
+#
+# A claim is only served when the request matches what the pool baked in
+# (isola transport, the resolution below, default theme/frame rate, no Tor,
+# watermark, or explicit bandwidth override); anything else falls back to the
+# cold path automatically. The session timer starts at entry either way — a
+# warm container has no session row, so no clock runs while it waits.
+#
+#   enabled: false         # true keeps `size` containers pre-warmed
+#   size: 1                # how many to keep warm (>= 1)
+# Env overrides: ISOLA_WARM_POOL_ENABLED, ISOLA_WARM_POOL_SIZE
+warm_pool:
+  enabled: false
+  size: 1
+
+browser:
+  type: "chromium"     # default; Isola always runs isola-browser:electron
+  theme: "auto"        # dark | light | auto
+  image: "isola-browser:electron"   # session container image; set a published image to run without building locally (env: ISOLA_BROWSER_IMAGE)
+
+  chromium:
+    enabled: true
+    flags: >
+      --site-per-process
+      --enable-features=BlockInsecurePrivateNetworkRequests,DisallowDocWrittenScriptLoads,ReducedReferrerGranularity
+
+settings:
+  resolution_visible: true   # show resolution picker on landing page
+  resolutions:               # available resolutions (value is WxH passed to browser; UI sorts them high-first)
+    - value: "1920x1080"
+      label: "1080p"
+    - value: "1280x720"
+      label: "720p"
+  # The browser picker is hidden: every session uses isola-browser:electron.
+  browser_visible: false
+  transport_visible: false   # single transport (isola); picker hidden on landing
+  transports:
+    - value: "isola"
+      label: "Isola"
+  default_transport: "isola"
+  isola_tabs: true           # show the tab strip + address bar in isola sessions
+
+# Optional bearer token for POST /api/sessions (spawns containers). When set,
+# clients must send Authorization: Bearer <token>. Env: ISOLA_API_TOKEN
+api:
+  token: ""
+
+# Model Context Protocol (MCP) over Streamable HTTP at POST /mcp.
+# Requires a non-empty token (>= 32 chars) when enabled.
+# Env: ISOLA_MCP_ENABLED, ISOLA_MCP_TOKEN
+mcp:
+  enabled: false
+  token: ""
+
+logging:
+  level: "info"        # debug | info | warn | error
+

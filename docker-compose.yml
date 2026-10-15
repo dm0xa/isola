@@ -1,0 +1,95 @@
+# ─────────────────────────────────────────────────────────────────
+# isola — single-file install
+# Usage:  docker compose up --build
+# Result: a single isola backend on http://localhost:8080 that serves
+#         the embedded UI, the API, and the WebSocket proxy.
+#
+# All images are built locally (pull_policy: build). Nothing is
+# pulled from Docker Hub — the stack is fully self-contained. (The standalone
+# scripts/install.sh is the exception: it fetches the published sandbox image
+# when it can and only then falls back to this build.)
+# ─────────────────────────────────────────────────────────────────
+
+services:
+  # Builds isola-browser:electron (Isola transport — offscreen + isola-streamer).
+  browser-node-electron:
+    image: isola-browser:electron
+    pull_policy: build
+    build:
+      context: ./browsers
+      dockerfile: browser-node-electron/Dockerfile
+    networks:
+      - isola
+    entrypoint: ["true"]
+    restart: "no"
+
+  # The single isola process: serves the embedded React UI on /, the API
+  # on /api/*, and the WebSocket proxy on /ws/*. Needs /var/run/docker.sock
+  # to spawn per-session browser containers.
+  isola:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: isola:latest
+    pull_policy: build
+    container_name: isola
+    ports:
+      - "${ISOLA_PORT:-8080}:8080"
+    environment:
+      - PORT=8080
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - CORS_ORIGIN=${CORS_ORIGIN:-http://localhost:8080}
+      - DISABLE_URL_VALIDATION=${DISABLE_URL_VALIDATION:-false}
+      - RESOLUTION=${RESOLUTION:-1280x720}
+      - ISOLA_SESSION_MEMORY_MB=${ISOLA_SESSION_MEMORY_MB:-}
+      - ISOLA_SESSION_CPUS=${ISOLA_SESSION_CPUS:-}
+      - ISOLA_SESSION_PIDS=${ISOLA_SESSION_PIDS:-}
+      - ISOLA_BROWSER_IMAGE=${ISOLA_BROWSER_IMAGE:-}
+      - ISOLA_MAX_SESSIONS=${ISOLA_MAX_SESSIONS:-}
+      - SESSION_DEFAULT_MIN=${SESSION_DEFAULT_MIN:-10}
+      - SESSION_MAX_MIN=${SESSION_MAX_MIN:-30}
+      - SESSION_EXTEND_MIN=${SESSION_EXTEND_MIN:-5}
+      - INACTIVITY_MIN=${INACTIVITY_MIN:-5}
+      - SESSION_TIMER=${SESSION_TIMER:-true}
+      - WARM_POOL_ENABLED=${WARM_POOL_ENABLED:-false}
+      - WARM_POOL_SIZE=${WARM_POOL_SIZE:-1}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - DNS_MODE=${DNS_MODE:-}
+      - DNS_SERVERS=${DNS_SERVERS:-}
+      - ISOLA_API_TOKEN=${ISOLA_API_TOKEN:-}
+      - ISOLA_MCP_ENABLED=${ISOLA_MCP_ENABLED:-false}
+      - ISOLA_MCP_TOKEN=${ISOLA_MCP_TOKEN:-}
+      # Require an enforcing MAC policy (AppArmor/SELinux) to confine session
+      # containers; set to 0 only on a host that deliberately runs without one.
+      - ISOLA_REQUIRE_MAC=${ISOLA_REQUIRE_MAC:-1}
+      - RATE_LIMITING_ENABLED=${RATE_LIMITING_ENABLED:-false}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./backend/config.yaml:/config.yaml:ro
+      - ./browsers/isola-base/seccomp.json:/etc/isola/seccomp.json:ro
+      - isola-data:/var/lib/isola
+    depends_on:
+      browser-node-electron:
+        condition: service_completed_successfully
+    networks:
+      - isola
+      - browser-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  isola:
+    name: isola
+    driver: bridge
+  browser-net:
+    name: browser-net
+    driver: bridge
+
+volumes:
+  isola-data:
+    name: isola-data

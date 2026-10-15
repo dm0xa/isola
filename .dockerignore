@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+.dbg
+node_modules
+frontend/node_modules
+frontend/dist
+**/*_test.go
+*.exe
+*.log
+.DS_Store

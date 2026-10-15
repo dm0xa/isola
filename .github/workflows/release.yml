@@ -1,0 +1,103 @@
+# Builds the release binaries + checksums that scripts/install.sh downloads from
+# https://github.com/dm0xa/isola/releases/latest/download
+#
+#   isola-<os>-<arch>-v<version>.tar.gz   (contains the `isola` binary)
+#   checksums.txt                         (<sha256>  <archive>)
+#
+# Triggered by pushing a tag like v1.0.0.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,  goarch: amd64 }
+          - { goos: linux,  goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags so the build can derive the version.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund && npm run build
+
+      - name: Embed frontend into the single-file binary
+        run: |
+          rm -rf backend/cmd/single-user/frontend-dist
+          mkdir -p backend/cmd/single-user/frontend-dist
+          cp -R frontend/dist/. backend/cmd/single-user/frontend-dist/
+
+      - name: Build binary
+        working-directory: backend
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X github.com/dm0xa/isola/backend/pkg/version.Version=${VERSION} \
+              -X github.com/dm0xa/isola/backend/pkg/version.Commit=${COMMIT} \
+              -X github.com/dm0xa/isola/backend/pkg/version.BuildTime=${BUILD_TIME}" \
+            -o ../dist/isola ./cmd/single-user
+
+      - name: Package
+        run: |
+          mkdir -p release
+          tar -czf "release/isola-${{ matrix.goos }}-${{ matrix.goarch }}-${GITHUB_REF_NAME}.tar.gz" -C dist isola
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: isola-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: release/*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums.txt
+        working-directory: artifacts
+        run: |
+          sha256sum *.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/checksums.txt
+          generate_release_notes: true

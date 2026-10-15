@@ -1,0 +1,14 @@
+{
+  "name": "electron-runner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Electron offscreen browser for isola transport",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "electron": "^34.0.0"
+  }
+}

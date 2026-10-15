@@ -1,0 +1,87 @@
+services:
+  # Reverse proxy
+  nginx:
+    build: ../nginx
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - isola
+
+  # Go backend — single-user mode (in-memory storage)
+  backend:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    ports:
+      # Bind to loopback only: nginx is the public entry point and reaches the
+      # backend over the internal network. Exposing 8080 on 0.0.0.0 bypasses
+      # nginx/TLS entirely (VULN-20).
+      - "127.0.0.1:8080:8080"
+    environment:
+      - PORT=8080
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - CORS_ORIGIN=http://localhost
+      # nginx runs on a Docker bridge network; trust its forwarded headers so
+      # per-IP rate limiting sees the real client (VULN-25).
+      - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-172.16.0.0/12}
+      - DISABLE_URL_VALIDATION=${DISABLE_URL_VALIDATION:-false}
+      # DNS for browser containers (see the dns section of backend/config.yaml).
+      # Leave unset to drive it from the config file; set DNS_MODE=tls|https for
+      # DNS-over-TLS or DNS-over-HTTPS.
+      - DNS_MODE=${DNS_MODE:-}
+      - DNS_SERVERS=${DNS_SERVERS:-}
+      # Session container image. Defaults to the image the Compose stack builds.
+      - ISOLA_BROWSER_IMAGE=${ISOLA_BROWSER_IMAGE:-}
+      # Require an enforcing MAC policy (AppArmor/SELinux) to confine session
+      # containers; set to 0 only on a host that deliberately runs without one.
+      - ISOLA_REQUIRE_MAC=${ISOLA_REQUIRE_MAC:-1}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # config.yaml is bind-mounted so operators can change UI options
+      # (transports/resolutions/visibility) with a restart, no rebuild.
+      - ../backend/config.yaml:/config.yaml:ro
+      - /dev/dri:/dev/dri  # Intel GPU access for hardware-accelerated encoding
+      - ../browsers/isola-base/seccomp.json:/etc/isola/seccomp.json:ro
+    networks:
+      - isola
+      - browser-net
+
+  # React frontend (dev mode with Vite)
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "5173:5173"
+    volumes:
+      - ../frontend/src:/app/src
+    environment:
+      - VITE_API_URL=http://localhost
+    networks:
+      - isola
+
+networks:
+  isola:
+    driver: bridge
+  browser-net:
+    # ── Security: hardened bridge for browser containers ──
+    # Only the backend is attached; no direct internet ingress.
+    # ICC disabled so compromised containers can't pivot laterally.
+    #
+    # The name is load-bearing: the orchestrator starts session containers with
+    # `--network browser-net`, so this network must be called exactly that. Left
+    # unnamed, Compose would project-prefix it (e.g. `isola_browser-net`) and
+    # session creation would fail with "network browser-net not found".
+    name: browser-net
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+      # Linux caps interface names at 15 characters (IFNAMSIZ - 1). A longer
+      # bridge name makes `docker network create` fail with the opaque
+      # "numerical result out of range", so this name is abbreviated
+      # deliberately (br-isola-browser would be 16).
+      com.docker.network.bridge.name: "br-isola-brows"

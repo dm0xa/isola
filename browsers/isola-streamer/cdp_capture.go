@@ -1,0 +1,458 @@
+package main
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+// Multi-target CDP capture.
+//
+// The input client (cdp.go) attaches to exactly one page target — the active
+// tab — because input has to land where the user is looking. While capture
+// rode on that connection it could only ever see the active tab: a freshly
+// opened or background tab produced no network entries at all, so it never
+// appeared in the panel's per-tab filter.
+//
+// This client attaches to the browser endpoint instead and uses
+// Target.setAutoAttach (flatten), so Chromium hands us a session for every
+// page target, including targets created later. Capture therefore covers every
+// tab, and each event arrives with the sessionId it came from, so attribution
+// is per tab instead of "whatever happens to be active".
+//
+// It never dispatches input and never touches the input client's connection.
+
+type captureTarget struct {
+	sessionID string
+	targetID  string
+	url       string
+	title     string
+	typ       string
+}
+
+type captureClient struct {
+	baseURL string
+
+	mu      sync.Mutex
+	conn    *websocket.Conn
+	nextID  int
+	targets map[string]*captureTarget // sessionId → attached page target
+	// pending maps in-flight command ids to their method names so a browser
+	// side rejection ({"id":N,"error":...}) can be logged with the command
+	// that failed. Without it a rejected Network.enable is indistinguishable
+	// from silence — capture just never produces anything.
+	pending map[int]string
+	// callbacks holds one-shot result handlers for commands whose reply the
+	// caller needs (Network.getResponseBody, for body hashing). Response bodies
+	// are not carried on any CDP event, so they must be asked for per request
+	// id; the read loop hands the reply back through here.
+	callbacks map[int]func(json.RawMessage)
+	// reloadPending: reload the first real (non-about:blank) page target once,
+	// so the START_URL navigation happens under capture. Chromium can start
+	// loading before DevTools accepts connections, which used to leave the
+	// first page load out of the capture entirely.
+	reloadPending bool
+}
+
+// activeCapture is the running browser-level capture client, published so the
+// network tap (netlog.go) can ask it for response bodies: bodies ride no event
+// stream, so they can only be fetched by request id on the owning session.
+var activeCapture *captureClient
+
+func newCaptureClient() *captureClient {
+	baseURL := os.Getenv("CDP_URL")
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1:9222"
+	}
+	return &captureClient{
+		baseURL:       baseURL,
+		nextID:        1,
+		targets:       make(map[string]*captureTarget),
+		pending:       make(map[int]string),
+		callbacks:     make(map[int]func(json.RawMessage)),
+		reloadPending: true,
+	}
+}
+
+func (c *captureClient) Start() {
+	for {
+		if err := c.connect(); err != nil {
+			log.Printf("capture: connect failed: %v (retry in 2s)", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		log.Printf("capture: browser auto-attach enabled")
+		c.readPump()
+		c.dropConn()
+		log.Printf("capture: disconnected, reconnecting")
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// connect dials the browser-level websocket (not a page target) and turns on
+// auto-attach for every current and future target.
+func (c *captureClient) connect() error {
+	resp, err := http.Get(c.baseURL + "/json/version")
+	if err != nil {
+		return fmt.Errorf("json/version: %w", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return fmt.Errorf("read json/version: %w", err)
+	}
+	var v struct {
+		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	}
+	if json.Unmarshal(body, &v) != nil || v.WebSocketDebuggerURL == "" {
+		return fmt.Errorf("no browser websocket in /json/version")
+	}
+
+	// Chromium echoes the bind address it was launched with, which may be
+	// 0.0.0.0. Dial the same host the HTTP probe just succeeded on.
+	ws, err := url.Parse(v.WebSocketDebuggerURL)
+	if err != nil {
+		return fmt.Errorf("parse browser ws url: %w", err)
+	}
+	if base, err := url.Parse(c.baseURL); err == nil && base.Host != "" {
+		ws.Host = base.Host
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(ws.String(), nil)
+	if err != nil {
+		return fmt.Errorf("dial browser ws: %w", err)
+	}
+
+	c.mu.Lock()
+	c.conn = conn
+	c.nextID = 1
+	c.targets = make(map[string]*captureTarget)
+	c.callbacks = make(map[int]func(json.RawMessage))
+	c.mu.Unlock()
+
+	// flatten: sessions ride this socket (events carry sessionId, commands can
+	// address one), instead of the nested sendMessageToTarget protocol.
+	return c.send("Target.setAutoAttach", map[string]interface{}{
+		"autoAttach":             true,
+		"waitForDebuggerOnStart": false,
+		"flatten":                true,
+	})
+}
+
+func (c *captureClient) readPump() {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
+		return
+	}
+	for {
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var env struct {
+			Method    string          `json:"method"`
+			Params    json.RawMessage `json:"params"`
+			SessionID string          `json:"sessionId"`
+		}
+		if json.Unmarshal(raw, &env) != nil {
+			continue
+		}
+		if env.Method == "" {
+			// No method ⇒ a command response. Log rejections with the
+			// command's method name; results are dropped.
+			c.onResponse(raw)
+			continue
+		}
+		switch env.Method {
+		case "Target.attachedToTarget":
+			// The new session id lives in params for attach/detach — the event
+			// originates at the browser endpoint, so the envelope's top-level
+			// sessionId is empty. Reading it from the envelope instead stores
+			// every target under "" and every domain command (Network.enable,
+			// Page.reload) is then rejected browser-side with "wasn't found",
+			// silently disabling all capture.
+			c.onAttached(env.Params)
+		case "Target.detachedFromTarget":
+			c.onDetached(env.Params)
+		case "Target.targetInfoChanged":
+			c.onInfoChanged(env.SessionID, env.Params)
+		default:
+			c.dispatch(env.Method, env.SessionID, env.Params)
+		}
+	}
+}
+
+func (c *captureClient) onAttached(params json.RawMessage) {
+	var p struct {
+		SessionID  string `json:"sessionId"`
+		TargetInfo struct {
+			TargetID string `json:"targetId"`
+			Type     string `json:"type"`
+			URL      string `json:"url"`
+			Title    string `json:"title"`
+		} `json:"targetInfo"`
+	}
+	if json.Unmarshal(params, &p) != nil || p.TargetInfo.TargetID == "" || p.SessionID == "" {
+		return
+	}
+	// Only pages carry the traffic we capture; workers, iframes and the
+	// browser target would just add sessions and noise.
+	if (p.TargetInfo.Type != "page" && p.TargetInfo.Type != "webview") ||
+		strings.HasPrefix(p.TargetInfo.URL, "devtools://") {
+		_ = c.sendSession("Target.detachFromTarget", map[string]interface{}{"sessionId": p.SessionID}, p.SessionID)
+		return
+	}
+
+	c.mu.Lock()
+	c.targets[p.SessionID] = &captureTarget{
+		sessionID: p.SessionID,
+		targetID:  p.TargetInfo.TargetID,
+		url:       p.TargetInfo.URL,
+		title:     p.TargetInfo.Title,
+		typ:       p.TargetInfo.Type,
+	}
+	reload := false
+	if c.reloadPending && !isBlankTargetURL(p.TargetInfo.URL) {
+		c.reloadPending = false
+		reload = true
+	}
+	c.mu.Unlock()
+
+	if err := c.sendSession("Network.enable", map[string]interface{}{}, p.SessionID); err != nil {
+		log.Printf("capture: Network.enable failed: %v", err)
+	}
+	if err := c.sendSession("Runtime.enable", map[string]interface{}{}, p.SessionID); err != nil {
+		log.Printf("capture: Runtime.enable failed: %v", err)
+	}
+	log.Printf("capture: target %s attached (%s)", shortTargetID(p.TargetInfo.TargetID), p.TargetInfo.URL)
+	if reload {
+		if err := c.sendSession("Page.reload", nil, p.SessionID); err != nil {
+			log.Printf("capture: Page.reload failed: %v", err)
+		} else {
+			log.Printf("capture: reloaded page for full network capture")
+		}
+	}
+}
+
+func (c *captureClient) onDetached(params json.RawMessage) {
+	var p struct {
+		SessionID string `json:"sessionId"`
+	}
+	if json.Unmarshal(params, &p) != nil || p.SessionID == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.targets, p.SessionID)
+	c.mu.Unlock()
+}
+
+func (c *captureClient) onInfoChanged(sessionID string, params json.RawMessage) {
+	var p struct {
+		TargetInfo struct {
+			TargetID string `json:"targetId"`
+			URL      string `json:"url"`
+			Title    string `json:"title"`
+		} `json:"targetInfo"`
+	}
+	if json.Unmarshal(params, &p) != nil {
+		return
+	}
+	c.mu.Lock()
+	t := c.targets[sessionID]
+	if t == nil && p.TargetInfo.TargetID != "" {
+		// Browser-level targetInfoChanged carries no envelope sessionId —
+		// fall back to matching a target we already track.
+		for _, cand := range c.targets {
+			if cand.targetID == p.TargetInfo.TargetID {
+				t = cand
+				break
+			}
+		}
+	}
+	if t != nil {
+		if p.TargetInfo.URL != "" {
+			t.url = p.TargetInfo.URL
+		}
+		t.title = p.TargetInfo.Title
+	}
+	c.mu.Unlock()
+}
+
+// dispatch routes one capture event to the matching tap. Events arrive with
+// the sessionId of the target they belong to, which is what makes per-tab
+// attribution possible at all.
+func (c *captureClient) dispatch(method, sessionID string, params json.RawMessage) {
+	if !isCaptureEventType(method) {
+		return
+	}
+	c.mu.Lock()
+	t := c.targets[sessionID]
+	c.mu.Unlock()
+	if t == nil {
+		return
+	}
+	tab := tabForTarget(t.url, t.title)
+	routeCaptureEvent(method, params, t.targetID, sessionID, tab)
+}
+
+// routeCaptureEvent fans one CDP event to every tap that owns it. ExtraInfo is
+// both a Network.* event and the cookie source, so these are independent ifs
+// rather than a switch — a Network. prefix must not starve the cookie tap.
+// sessionID is passed through because a tap may need to command the same
+// target (the network tap fetches response bodies to hash them).
+func routeCaptureEvent(method string, params json.RawMessage, targetID, sessionID string, tab int) {
+	if isNetEventType(method) {
+		netMonitorTap(targetID, sessionID, method, params, tab)
+	}
+	if isCookieEventType(method) {
+		cookieTap(params)
+	}
+	if isConsoleEventType(method) {
+		consoleTap(method, params, tab)
+	}
+}
+
+func (c *captureClient) send(method string, params map[string]interface{}) error {
+	return c.sendSession(method, params, "")
+}
+
+func (c *captureClient) sendSession(method string, params map[string]interface{}, sessionID string) error {
+	return c.sendSessionCallback(method, params, sessionID, nil)
+}
+
+// sendSessionCallback is sendSession plus a one-shot handler for the command's
+// result. The capture read loop invokes it with the raw `result` payload (nil
+// when the browser rejected the command), then forgets it — the reply must be
+// consumed exactly once or not at all.
+func (c *captureClient) sendSessionCallback(method string, params map[string]interface{}, sessionID string, cb func(json.RawMessage)) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn == nil {
+		return fmt.Errorf("capture not connected")
+	}
+	id := c.nextID
+	msg := map[string]interface{}{
+		"id":     id,
+		"method": method,
+	}
+	c.pending[id] = method
+	if cb != nil {
+		c.callbacks[id] = cb
+	}
+	c.nextID++
+	if params != nil {
+		msg["params"] = params
+	}
+	if sessionID != "" {
+		msg["sessionId"] = sessionID
+	}
+	return c.conn.WriteJSON(msg)
+}
+
+// requestResponseBody asks Chromium for one request's response body and hands
+// the decoded bytes to cb (nil when the body is unavailable — evicted from
+// cache, a redirect hop, a rejected command, or a non-text body whose base64
+// failed to decode). Used to hash loaded files; the request must still be in
+// the browser's response cache, which it is right after Network.loadingFinished.
+func (c *captureClient) requestResponseBody(sessionID, requestID string, cb func([]byte)) error {
+	return c.sendSessionCallback(
+		"Network.getResponseBody",
+		map[string]interface{}{"requestId": requestID},
+		sessionID,
+		func(raw json.RawMessage) {
+			var res struct {
+				Body          string `json:"body"`
+				Base64Encoded bool   `json:"base64Encoded"`
+			}
+			if len(raw) == 0 || json.Unmarshal(raw, &res) != nil || res.Body == "" {
+				cb(nil)
+				return
+			}
+			if res.Base64Encoded {
+				b, err := base64.StdEncoding.DecodeString(res.Body)
+				if err != nil {
+					cb(nil)
+					return
+				}
+				cb(b)
+				return
+			}
+			cb([]byte(res.Body))
+		},
+	)
+}
+
+// onResponse handles a command response (no method). Browser-side rejections
+// (e.g. "'Network.enable' wasn't found") used to vanish silently here; log
+// them with the originating command so capture failures are diagnosable.
+func (c *captureClient) onResponse(raw []byte) {
+	var r struct {
+		ID     int             `json:"id"`
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &r) != nil || r.ID == 0 {
+		return
+	}
+	c.mu.Lock()
+	cb := c.callbacks[r.ID]
+	delete(c.callbacks, r.ID)
+	method := c.pending[r.ID]
+	delete(c.pending, r.ID)
+	c.mu.Unlock()
+	if cb != nil {
+		// nil result when the command was rejected.
+		cb(r.Result)
+		return
+	}
+	if r.Error != nil {
+		log.Printf("capture: CDP error in %s: %s", method, r.Error.Message)
+	}
+}
+
+func (c *captureClient) dropConn() {
+	c.mu.Lock()
+	conn := c.conn
+	c.conn = nil
+	c.targets = make(map[string]*captureTarget)
+	c.pending = make(map[int]string)
+	c.callbacks = make(map[int]func(json.RawMessage))
+	c.mu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
+}
+
+// isCaptureEventType is the cheap prefix check before any JSON work.
+func isCaptureEventType(method string) bool {
+	return isNetEventType(method) || isCookieEventType(method) || isConsoleEventType(method)
+}
+
+func isBlankTargetURL(u string) bool {
+	return u == "" || u == "about:blank" || u == "chrome://newtab/" || u == "edge://newtab/"
+}
+
+// shortTargetID keeps CDP request ids readable in the UI while staying unique
+// per target: request ids are per-target, so two tabs can legitimately both
+// have a request "1".
+func shortTargetID(targetID string) string {
+	if len(targetID) > 8 {
+		return targetID[:8]
+	}
+	return targetID
+}

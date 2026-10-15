@@ -1,0 +1,77 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Open-core / Enterprise Edition — private source, cloned locally into ee/
+# (see ee/README.md). Never commit it to the community repo.
+ee/
+
+# Build output
+dist/
+temp/
+tmp/
+*.exe
+*.prof
+*.test
+*.tsbuildinfo
+
+# Binaries and build artifacts (Go)
+backend/isola
+backend/isola-*
+backend/server
+backend/single-user
+browsers/isola-streamer/isola-streamer
+# Embedded frontend for single-user binary — generated from /frontend source
+# Preserve the directory skeleton via .gitkeep; everything else is build output
+/backend/cmd/single-user/frontend-dist/*
+!/backend/cmd/single-user/frontend-dist/.gitkeep
+
+# Go workspace + coverage artifacts (developer-local, not shared)
+coverage/
+coverage.*
+*.coverprofile
+go.work
+go.work.sum
+
+# Environment overrides (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Debug artifacts
+.dbg/
+debug-*
+*~
+
+# Local editor / tool state
+.idea/
+.vscode/
+.vite/
+# Cursor MCP config holds a live Bearer token — never commit it.
+.cursor/
+
+# Logs
+*.log
+
+# Certificates, keys, license signatures and artifacts
+*.crt
+*.csr
+*.key
+*.lic
+*.p12
+*.pem
+*.pfx
+
+# Archives
+*.tar.gz
+*.tgz
+*.zip
+
+# OS clutter
+.DS_Store
+Desktop.ini
+ehthumbs.db
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
