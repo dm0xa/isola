@@ -7,9 +7,9 @@ set -euo pipefail
 # ────────────────────────────────────────────────────────────
 
 readonly DOWNLOAD_BASE="${ISOLA_DOWNLOAD_BASE:-https://github.com/dm0xa/isola/releases/latest/download}"
+readonly RELEASES_URL="${ISOLA_RELEASES_URL:-https://github.com/dm0xa/isola/releases}"
 readonly INSTALL_DIR="${ISOLA_INSTALL_DIR:-/opt/isola}"
 readonly BINARY_NAME="isola"
-readonly VERSION="${ISOLA_VERSION:-1.0.0}"
 
 # Per-session sandbox image the isola binary launches at runtime.
 readonly BROWSER_IMAGE="isola-browser:electron"
@@ -40,6 +40,35 @@ info()    { printf "${CYAN}●${NC} %s\n" "$*"; }
 success() { printf "${GREEN}✓${NC} %s\n" "$*"; }
 warn()    { printf "${YELLOW}⚠${NC} %s\n" "$*"; }
 error()   { printf "${RED}✗${NC} %s\n" "$*"; }
+
+# ── which version to install ───────────────────────────────────────────
+# DOWNLOAD_BASE is the /releases/latest/download alias, so the version in the
+# asset filename must match whatever release is latest *right now*. A hard-coded
+# pin does not merely install an older version — it asks for an asset the newer
+# release does not contain, and the download 404s. ISOLA_VERSION skips the
+# lookup and pins an exact version.
+resolve_version() {
+    if [[ -n "${ISOLA_VERSION:-}" ]]; then
+        printf '%s' "${ISOLA_VERSION#v}"
+        return 0
+    fi
+
+    # /releases/latest redirects to /releases/tag/vX.Y.Z. Follow it and read the
+    # tag out of the final URL: no API call, so no rate limit and no jq.
+    local effective=""
+    effective="$(curl -fsSIL -o /dev/null -w '%{url_effective}' "${RELEASES_URL}/latest" 2>/dev/null || true)"
+    case "$effective" in
+        */tag/v*) printf '%s' "${effective##*/tag/v}"; return 0 ;;
+    esac
+    return 1
+}
+
+if ! VERSION="$(resolve_version)"; then
+    error "Could not determine the latest isola release."
+    error "Check your network, or pin a version: ISOLA_VERSION=1.0.0"
+    exit 1
+fi
+readonly VERSION
 
 # ── detect OS / arch ────────────────────────────────────────────────
 detect_platform() {
