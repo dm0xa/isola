@@ -61,6 +61,8 @@ Then open [http://localhost:8080](http://localhost:8080). That single process se
 > **First build only:** `up --build` compiles the Go backend, builds the React frontend, and constructs the `isola-browser:electron` and `isola` images. Later starts reuse the cached layers and are fast.
 
 > **Not using Compose?** [`scripts/install.sh`](../scripts/install.sh) installs the `isola` binary and sets up a systemd service (or a macOS LaunchAgent), installing Docker and creating the `browser-net` network on the way. See [Deployment → Run Without Compose](deployment.md#run-without-compose).
+>
+> **Installing by hand instead?** [Deployment → Manual install](deployment.md#manual-install) downloads the release tarball, verifies its checksum, pulls the sandbox image and creates the network, with no script piped to `bash`.
 
 To run it detached and follow logs:
 

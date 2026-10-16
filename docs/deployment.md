@@ -36,6 +36,46 @@ Moving to Compose later: the stack declares its own `browser-net`, so if the ins
 
 Isola listens on **all interfaces** on its port, so on a host with a public IP either put it behind the reverse proxy below or restrict the port in the host/cloud firewall, and gate session creation with `ISOLA_API_TOKEN`.
 
+### Manual install
+
+The installer is the easy path, but every step it performs is plain `curl`, `tar` and `docker` — useful when you would rather not pipe a script to a shell (hardened servers, CI, immutable or non-root installs). Choose the archive that matches `uname -sm`:
+
+| `uname -sm` | Archive |
+| :--- | :--- |
+| `Linux x86_64` | `isola-linux-amd64` |
+| `Linux aarch64` | `isola-linux-arm64` |
+| `Darwin arm64` | `isola-darwin-arm64` |
+| `Darwin x86_64` | `isola-darwin-amd64` |
+
+Pin an exact release tag. Do **not** use the `/releases/latest/download` alias with a hard-coded filename: the asset name carries the version, so a stale name simply 404s. `VERSION` below is an example — substitute a real tag from the [releases page](https://github.com/dm0xa/isola/releases).
+
+```bash
+VERSION=1.0.0                              # a real release tag, without the leading v
+GOOS=linux GOARCH=amd64                    # from `uname -sm` above
+BASE="https://github.com/dm0xa/isola/releases/download/v${VERSION}"
+ARCHIVE="isola-${GOOS}-${GOARCH}-v${VERSION}.tar.gz"
+
+curl -fsSLO "${BASE}/${ARCHIVE}"
+curl -fsSLO "${BASE}/checksums.txt"
+# Verify before running the binary — checksums.txt covers every archive, so
+# check only the one you downloaded. macOS: swap sha256sum for `shasum -a 256`.
+grep "${ARCHIVE}" checksums.txt | sha256sum -c -
+
+tar xzf "${ARCHIVE}"                      # extracts ./isola
+./isola                                    # UI + API + relay on :8080
+```
+
+The binary ships without the sandbox image (the two are released separately). Fetch the published per-session image and re-tag it to the name the binary launches, `isola-browser:electron` — the same step the installer performs:
+
+```bash
+docker pull ghcr.io/dm0xa/isola-browser:electron
+docker tag  ghcr.io/dm0xa/isola-browser:electron isola-browser:electron
+```
+
+If the package is private, authenticate first (`docker login ghcr.io`). If you have a source checkout you can build it locally instead (`docker compose build browser-node-electron`), but arm64 and x86-64 images are not interchangeable — build on the target host or on a matching architecture. To launch a differently named image altogether, set `ISOLA_BROWSER_IMAGE`.
+
+Finally create the `browser-net` network (command and rationale above) and start `./isola`. Everything else in this section applies as-is: the `docker` CLI on `PATH`, Docker socket access, and a writable `ISOLA_DATA_DIR`. To run it as a service rather than in the foreground, write the unit yourself — `scripts/install.sh` generates one for reference.
+
 ## Host Requirements
 
 Keep an enforcing MAC policy active on the host. Session containers rely on AppArmor's `docker-default` profile (or SELinux's container policy) as a defence-in-depth layer, and the entrypoint **fails closed** if neither is enforcing — `docker info` reports the active profile under `Security Options`, and sessions log `MAC confinement active: …` when the check passes. `ISOLA_REQUIRE_MAC=0` overrides the check for hosts that deliberately run without an LSM (not recommended).

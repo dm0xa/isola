@@ -105,6 +105,8 @@ curl -fsSL https://raw.githubusercontent.com/dm0xa/isola/main/scripts/install.sh
 
 Read it first: `curl -fsSL https://raw.githubusercontent.com/dm0xa/isola/main/scripts/install.sh | less`. In-repo source: [`scripts/install.sh`](./scripts/install.sh). `ISOLA_INSTALL_DIR` / `ISOLA_VERSION` override the install location and version. Then open <http://localhost:8080>.
 
+Prefer not to pipe a script to a shell? [Manual install](./docs/deployment.md#manual-install) does the same thing by hand — download the release tarball, verify its SHA-256, pull the sandbox image and create the network.
+
 ### From source
 
 Needs **BuildKit** and **Compose v2**. This is also how you build `isola-browser:electron`.
